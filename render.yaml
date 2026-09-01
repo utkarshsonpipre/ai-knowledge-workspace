@@ -1,0 +1,62 @@
+# Render blueprint. The backend needs a long-lived process — it holds the
+# Socket.IO server and the BullMQ workers — so it is a web service, not a
+# serverless function.
+services:
+  - type: web
+    name: knowledge-workspace-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+      # Supabase Postgres (pgvector). Use the pooled URL for the app and the
+      # direct 5432 URL for migrations.
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      # Upstash Redis — the rediss:// TCP endpoint, not the REST URL.
+      - key: REDIS_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_TTL
+        value: 15m
+      - key: JWT_REFRESH_TTL
+        value: 7d
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_SECRET
+        sync: false
+      - key: GITHUB_CALLBACK_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: GROK_API_KEY
+        sync: false
+      - key: GROK_BASE_URL
+        value: https://api.x.ai/v1
+      - key: GROK_MODEL
+        value: grok-4-fast
+      - key: EMBEDDING_PROVIDER
+        value: local
+      - key: EMBEDDING_DIMENSIONS
+        value: 384
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: knowledge-files
+      - key: SENTRY_DSN
+        sync: false

@@ -1,0 +1,196 @@
+// Single Postgres instance (Supabase in prod) serves relational data AND the
+// vector store. `vector` extension is declared here so `prisma migrate` creates
+// it; the embedding column uses Unsupported() because Prisma has no native
+// pgvector type — similarity search runs through $queryRaw in SearchService.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  // Supabase pools connections on 6543; migrations need the direct 5432 port.
+  directUrl  = env("DIRECT_URL")
+  extensions = [vector]
+}
+
+enum AIRequestType {
+  SUMMARIZE
+  REWRITE
+  GENERATE
+  CHAT
+}
+
+enum AIRequestStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum FileStatus {
+  PENDING
+  UPLOADING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum ChunkSource {
+  DOCUMENT
+  FILE
+}
+
+model User {
+  id        String   @id @default(cuid())
+  githubId  String   @unique @map("github_id")
+  email     String?  @unique
+  name      String?
+  avatar    String?
+  // Free-form UI/AI preferences (theme, default rewrite mode, ...).
+  preferences Json   @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  documents     Document[]
+  files         File[]
+  aiRequests    AIRequest[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+// Refresh tokens are persisted (hashed) so rotation can detect replay: a used
+// token is revoked and linked to its successor. Presenting a revoked token
+// invalidates the whole chain.
+model RefreshToken {
+  id            String    @id @default(cuid())
+  userId        String    @map("user_id")
+  tokenHash     String    @unique @map("token_hash")
+  expiresAt     DateTime  @map("expires_at")
+  revokedAt     DateTime? @map("revoked_at")
+  replacedById  String?   @map("replaced_by_id")
+  userAgent     String?   @map("user_agent")
+  ip            String?
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model Document {
+  id    String @id @default(cuid())
+  title String @default("Untitled")
+  // Tiptap document JSON — the editor's source of truth.
+  content Json @default("{\"type\":\"doc\",\"content\":[]}")
+  // Flattened text kept in sync on every save: powers FTS, chunking, AI input.
+  plainText String @default("") @map("plain_text")
+  // { summary, keyPoints[], actionItems[] } produced by the summarize job.
+  summary    Json?
+  icon       String?
+  isArchived Boolean @default(false) @map("is_archived")
+  userId     String  @map("user_id")
+
+  // Generated tsvector maintained by Postgres (see the init migration). Never
+  // read through Prisma — only by the raw FTS query in SearchService. The
+  // expression is mirrored here so `migrate diff` reports no drift.
+  searchVector Unsupported("tsvector")? @default(dbgenerated("(setweight(to_tsvector('english'::regconfig, COALESCE(title, ''::text)), 'A'::\"char\") || setweight(to_tsvector('english'::regconfig, COALESCE(plain_text, ''::text)), 'B'::\"char\"))")) @map("search_vector")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chunks     DocumentChunk[]
+  sourceFile File?
+  aiRequests AIRequest[]
+
+  @@index([userId, updatedAt])
+  @@index([searchVector], type: Gin)
+  @@map("documents")
+}
+
+model File {
+  id       String @id @default(cuid())
+  filename String
+  // Object path inside the Supabase Storage bucket.
+  storagePath String @map("storage_path")
+  url         String @default("")
+  type        String
+  size        Int
+  userId      String @map("user_id")
+
+  status FileStatus @default(PENDING)
+  error  String?
+
+  // Extraction turns an uploaded file into a first-class Document, so files and
+  // hand-written notes share one chunking / search / chat code path.
+  documentId String? @unique @map("document_id")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  processedAt DateTime? @map("processed_at")
+
+  user     User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document?       @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  chunks   DocumentChunk[]
+
+  @@index([userId, createdAt])
+  @@map("files")
+}
+
+model DocumentChunk {
+  id         String  @id @default(cuid())
+  documentId String  @map("document_id")
+  fileId     String? @map("file_id")
+  content    String
+  chunkIndex Int     @map("chunk_index")
+
+  // 384 dims: Xenova/all-MiniLM-L6-v2 natively, OpenAI text-embedding-3-small
+  // truncated via the `dimensions` param. Fixed width so providers stay swappable.
+  embedding Unsupported("vector(384)")?
+
+  source     ChunkSource @default(DOCUMENT)
+  metadata   Json        @default("{}")
+  tokenCount Int?        @map("token_count")
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  file     File?    @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  // The HNSW index on `embedding` lives only in the migration SQL — Prisma has
+  // no index type for it, so `migrate diff` will always report that one index
+  // as missing. Never "fix" that by dropping it.
+  @@unique([documentId, chunkIndex])
+  @@index([documentId])
+  @@index([fileId])
+  @@map("document_chunks")
+}
+
+model AIRequest {
+  id         String          @id @default(cuid())
+  userId     String          @map("user_id")
+  documentId String?         @map("document_id")
+  type       AIRequestType
+  status     AIRequestStatus @default(PENDING)
+  input      String
+  output     String?
+  // Structured payload for summarize (keyPoints/actionItems) and chat (sources).
+  result     Json?
+  error      String?
+  jobId      String?         @map("job_id")
+  tokensUsed Int?            @map("tokens_used")
+  model      String?
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  completedAt DateTime? @map("completed_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@map("ai_requests")
+}

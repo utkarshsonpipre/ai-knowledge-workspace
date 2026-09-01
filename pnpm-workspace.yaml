@@ -1,0 +1,13 @@
+packages:
+  - backend
+  - frontend
+
+# pnpm 10 blocks lifecycle scripts by default; these genuinely need theirs
+# (engine download, native builds).
+onlyBuiltDependencies:
+  - '@prisma/client'
+  - '@prisma/engines'
+  - prisma
+  - msgpackr-extract
+  - protobufjs
+  - sharp
